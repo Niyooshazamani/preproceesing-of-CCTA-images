@@ -1,44 +1,54 @@
-import os
-import shutil
+!pip install SimpleITK numpy
+from pathlib import Path
 import csv
+import shutil
+
 import numpy as np
 import SimpleITK as sitk
-INPUT_DIR = 'C:/Users/zaman/OneDrive/Desktop/mimage' 
 
-OUTPUT_DIR = 'C:/Users/zaman/Desktop/mimage1' 
 
-# ZIP نهایی
-ZIP_PATH = 'C:/Users/zaman/Desktop'
-HU_MIN = -1000
-HU_MAX = 3000
-
-NEW_SPACING = (1.0, 1.0, 1.0)
-
-# برای تشخیص اسلایس خالی
-EMPTY_TOLERANCE = 1e-6
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-# HU CLIPPING
+# ============================================================
+# 1. INPUT AND OUTPUT PATHS
 # ============================================================
 
-def clip_hu(image, hu_min=-1000, hu_max=3000):
+# Find "segmentation2" on Desktop or OneDrive Desktop
+desktop_candidates = [
+    Path.home() / "Desktop",
+    Path.home() / "OneDrive" / "Desktop",
+]
 
-    # Convert to float32 to preserve negative HU values
-    image = sitk.Cast(image, sitk.sitkFloat32)
+INPUT_DIR = next(
+    (
+        desktop / "segmentation2"
+        for desktop in desktop_candidates
+        if (desktop / "segmentation2").is_dir()
+    ),
+    None
+)
 
-    array = sitk.GetArrayFromImage(image)
+if INPUT_DIR is None:
+    searched = "\n".join(
+        str(p / "segmentation2")
+        for p in desktop_candidates
+    )
+    raise FileNotFoundError(
+        "Could not find segmentation2 folder.\n"
+        + searched
+    )
 
-    # Clip HU values
-    array = np.clip(array, hu_min, hu_max)
+OUTPUT_DIR = INPUT_DIR.parent / "segmentation2_processed"
+ZIP_BASE_PATH = INPUT_DIR.parent / "segmentation2_processed"
 
-    clipped_image = sitk.GetImageFromArray(array.astype(np.float32))
+NEW_SPACING = (1.0, 1.0, 1.0)
+EMPTY_TOLERANCE = 1e-6
+EXPECTED_FILE_COUNT = 49
 
-    # Preserve spatial information
-    clipped_image.CopyInformation(image)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    return clipped_image
 
-# RESAMPLING TO 1 x 1 x 1 mm
+# ============================================================
+# 2. RESAMPLING TO 1 x 1 x 1 mm
+# NO HU CLIPPING
 # ============================================================
 
 def resample_image(image, new_spacing=(1.0, 1.0, 1.0)):
@@ -46,13 +56,16 @@ def resample_image(image, new_spacing=(1.0, 1.0, 1.0)):
     old_spacing = image.GetSpacing()
     old_size = image.GetSize()
 
-    # Preserve physical extent of the image
+    # Preserve physical image extent
     new_size = [
-        int(round(
-            (old_size[i] - 1) *
-            old_spacing[i] /
-            new_spacing[i]
-        )) + 1
+        max(
+            1,
+            int(round(
+                (old_size[i] - 1)
+                * old_spacing[i]
+                / new_spacing[i]
+            )) + 1
+        )
         for i in range(3)
     ]
 
@@ -64,103 +77,57 @@ def resample_image(image, new_spacing=(1.0, 1.0, 1.0)):
     resampler.SetOutputOrigin(image.GetOrigin())
     resampler.SetOutputDirection(image.GetDirection())
 
-    # Linear interpolation is appropriate for CT intensity images
+    # Same linear interpolation as original code
     resampler.SetInterpolator(sitk.sitkLinear)
 
-    # Empty/background voxels outside the original field
     resampler.SetDefaultPixelValue(0)
 
-    resampled_image = resampler.Execute(image)
+    return resampler.Execute(image)
 
-    return resampled_image
 
-# REMOVE EMPTY SLICES FROM BEGINNING AND END ONLY
+# ============================================================
+# 3. REMOVE EMPTY SLICES FROM BEGINNING AND END ONLY
 # ============================================================
 
 def remove_empty_edge_slices(image, tolerance=1e-6):
 
-    # SimpleITK array order:
-    # [z, y, x]
+    # SimpleITK array order: [z, y, x]
     array = sitk.GetArrayFromImage(image)
 
     number_of_slices = array.shape[0]
 
-    # Determine which slices are completely empty
     empty = np.array([
         np.all(np.abs(array[z]) <= tolerance)
         for z in range(number_of_slices)
     ])
 
-    # If the entire image is empty
     if np.all(empty):
         raise ValueError("The entire image is empty.")
 
-    # Find first non-empty slice
-    first_non_empty = np.where(~empty)[0][0]
-
-    # Find last non-empty slice
-    last_non_empty = np.where(~empty)[0][-1]
+    first_non_empty = int(np.where(~empty)[0][0])
+    last_non_empty = int(np.where(~empty)[0][-1])
 
     removed_from_start = first_non_empty
 
     removed_from_end = (
-        number_of_slices -
-        last_non_empty -
-        1
+        number_of_slices
+        - last_non_empty
+        - 1
     )
- # --------------------------------------------------------
-    # IMPORTANT:
-    # We use RegionOfInterest rather than np.delete.
-    #
-    # This preserves the NIfTI spatial geometry and correctly
-    # updates the image origin after removing leading slices.
-    # --------------------------------------------------------
 
+    # RegionOfInterest preserves spatial geometry
     original_size = image.GetSize()
 
     roi_index = [
         0,
         0,
-        int(first_non_empty)
+        first_non_empty
     ]
 
     roi_size = [
         original_size[0],
         original_size[1],
-        int(last_non_empty - first_non_empty + 1)
-    ]
-
-    cropped_image = sitk.RegionOfInterest(
-        image,
-        size=roi_size,
-        index=roi_index
-    )
-
-    return (
-        cropped_image,
-        removed_from_start,
-        removed_from_end
-    )
- # --------------------------------------------------------
-    # IMPORTANT:
-    # We use RegionOfInterest rather than np.delete.
-    #
-    # This preserves the NIfTI spatial geometry and correctly
-    # updates the image origin after removing leading slices.
-    # --------------------------------------------------------
-
-    original_size = image.GetSize()
-
-    roi_index = [
-        0,
-        0,
-        int(first_non_empty)
-    ]
-
-    roi_size = [
-        original_size[0],
-        original_size[1],
-        int(last_non_empty - first_non_empty + 1)
+        last_non_empty - first_non_empty + 1
     ]
 
     cropped_image = sitk.RegionOfInterest(
@@ -175,63 +142,78 @@ def remove_empty_edge_slices(image, tolerance=1e-6):
         removed_from_end
     )
 
-# Helper for filenames
+
+# ============================================================
+# 4. OUTPUT FILENAME
 # ============================================================
 
 def get_output_filename(filename):
 
-    if filename.endswith(".nii.gz"):
-
+    if filename.lower().endswith(".nii.gz"):
         base = filename[:-7]
 
-    elif filename.endswith(".nii"):
-
+    elif filename.lower().endswith(".nii"):
         base = filename[:-4]
 
     else:
-
         base = filename
 
     return f"processed_{base}.nii.gz"
 
 
 # ============================================================
-# PROCESS ALL PATIENTS
+# 5. FIND AND PROCESS ALL NIFTI FILES
 # ============================================================
+
+files = sorted(
+    [
+        p for p in INPUT_DIR.iterdir()
+        if p.is_file()
+        and p.name.lower().endswith((".nii", ".nii.gz"))
+    ],
+    key=lambda p: p.name.lower()
+)
+
+print(f"Input folder: {INPUT_DIR}")
+print(f"Output folder: {OUTPUT_DIR}")
+print(f"Number of NIfTI files found: {len(files)}")
+print("HU clipping: DISABLED")
+print("=" * 70)
+
+if not files:
+    raise FileNotFoundError(
+        f"No NIfTI images found in {INPUT_DIR}"
+    )
+
+if len(files) != EXPECTED_FILE_COUNT:
+    print(
+        f"WARNING: Expected {EXPECTED_FILE_COUNT} "
+        f"images, found {len(files)}."
+    )
+    print("All detected images will be processed.")
 
 report = []
 
-files = sorted([
-    f for f in os.listdir(INPUT_DIR)
-    if f.endswith(".nii") or f.endswith(".nii.gz")
-])
+for i, input_path in enumerate(files, start=1):
 
-print(f"Number of NIfTI images found: {len(files)}")
-print("=" * 70)
-
-
-for i, filename in enumerate(files, start=1):
-
-    input_path = os.path.join(
-        INPUT_DIR,
-        filename
-    )
+    filename = input_path.name
 
     output_filename = get_output_filename(filename)
 
-    output_path = os.path.join(
-        OUTPUT_DIR,
-        output_filename
-    )
+    output_path = OUTPUT_DIR / output_filename
 
     print(f"\n[{i}/{len(files)}] Processing: {filename}")
 
     try:
-        # ----------------------------------------------------
-        # Load image
-        # ----------------------------------------------------
 
-        image = sitk.ReadImage(input_path)
+        # --------------------------------------------
+        # LOAD ORIGINAL IMAGE
+        # --------------------------------------------
+
+        image = sitk.ReadImage(str(input_path))
+
+        if image.GetDimension() != 3:
+            raise ValueError("Expected a 3D NIfTI image.")
 
         original_spacing = image.GetSpacing()
         original_size = image.GetSize()
@@ -241,23 +223,13 @@ for i, filename in enumerate(files, start=1):
         original_min = float(np.min(original_array))
         original_max = float(np.max(original_array))
 
+        # Convert only the datatype for interpolation.
+        # This does NOT clip or truncate the HU range.
+        image = sitk.Cast(image, sitk.sitkFloat32)
 
-        # ----------------------------------------------------
-        # STEP 1
-        # HU clipping
-        # ----------------------------------------------------
-
-        image = clip_hu(
-            image,
-            HU_MIN,
-            HU_MAX
-        )
-
-
-        # ----------------------------------------------------
-        # STEP 2
-        # Resample to 1 x 1 x 1 mm^3
-        # ----------------------------------------------------
+        # --------------------------------------------
+        # STEP 1: RESAMPLE TO 1 x 1 x 1 mm
+        # --------------------------------------------
 
         image = resample_image(
             image,
@@ -266,11 +238,9 @@ for i, filename in enumerate(files, start=1):
 
         resampled_size = image.GetSize()
 
-
-        # ----------------------------------------------------
-        # STEP 3
-        # Remove empty slices from beginning/end
-        # ----------------------------------------------------
+        # --------------------------------------------
+        # STEP 2: REMOVE EMPTY EDGE SLICES
+        # --------------------------------------------
 
         (
             image,
@@ -281,106 +251,77 @@ for i, filename in enumerate(files, start=1):
             EMPTY_TOLERANCE
         )
 
-
         final_size = image.GetSize()
 
-
-        # ----------------------------------------------------
-        # STEP 4
-        # Save final image
-        # ----------------------------------------------------
+        # --------------------------------------------
+        # STEP 3: SAVE IMAGE
+        # --------------------------------------------
 
         sitk.WriteImage(
             image,
-            output_path,
+            str(output_path),
             True
         )
 
-
-        # ----------------------------------------------------
-        # Report
-        # ----------------------------------------------------
+        # --------------------------------------------
+        # STEP 4: RECORD RESULTS
+        # --------------------------------------------
 
         report.append({
 
-            "filename":
-                filename,
+            "filename": filename,
+            "output_filename": output_filename,
 
-            "original_spacing_x":
-                original_spacing[0],
+            "original_spacing_x": original_spacing[0],
+            "original_spacing_y": original_spacing[1],
+            "original_spacing_z": original_spacing[2],
 
-            "original_spacing_y":
-                original_spacing[1],
+            "original_size_x": original_size[0],
+            "original_size_y": original_size[1],
+            "original_size_z": original_size[2],
 
-            "original_spacing_z":
-                original_spacing[2],
+            "original_min_HU": original_min,
+            "original_max_HU": original_max,
 
-            "original_size_x":
-                original_size[0],
+            "resampled_size_z": resampled_size[2],
 
-            "original_size_y":
-                original_size[1],
+            "removed_start_slices": removed_start,
+            "removed_end_slices": removed_end,
 
-            "original_size_z":
-                original_size[2],
+            "final_size_x": final_size[0],
+            "final_size_y": final_size[1],
+            "final_size_z": final_size[2],
 
-            "original_min_HU":
-                original_min,
+            "final_spacing": "1x1x1 mm",
 
-            "original_max_HU":
-                original_max,
-
-            "resampled_size_z":
-                resampled_size[2],
-
-            "removed_start_slices":
-                removed_start,
-
-            "removed_end_slices":
-                removed_end,
-
-            "final_size_x":
-                final_size[0],
-
-            "final_size_y":
-                final_size[1],
-
-            "final_size_z":
-                final_size[2],
-
-            "final_spacing":
-                "1x1x1 mm",
-
-            "status":
-                "success"
+            "status": "success"
         })
 
+        print(
+            "   Original spacing:",
+            tuple(round(x, 3) for x in original_spacing)
+        )
 
-        print("   Original spacing:",
-              tuple(round(x, 3)
-                    for x in original_spacing))
+        print(
+            "   Original HU range:",
+            f"{original_min:.1f} to {original_max:.1f}"
+        )
 
-        print("   Original HU range:",
-              f"{original_min:.1f} to {original_max:.1f}")
+        print("   HU clipping: NONE")
+        print("   New spacing:", image.GetSpacing())
 
-        print("   HU clipping:",
-              f"{HU_MIN} to {HU_MAX}")
+        print(
+            "   Empty slices removed from start:",
+            removed_start
+        )
 
-        print("   New spacing:",
-              image.GetSpacing())
+        print(
+            "   Empty slices removed from end:",
+            removed_end
+        )
 
-        print("   Empty slices removed from start:",
-              removed_start)
-
-        print("   Empty slices removed from end:",
-              removed_end)
-
-        print("   Final size:",
-              final_size)
-
-        print("   Saved:",
-              output_filename)
-
+        print("   Final size:", final_size)
+        print("   Saved:", output_filename)
 
     except Exception as e:
 
@@ -390,60 +331,94 @@ for i, filename in enumerate(files, start=1):
             "filename": filename,
             "status": f"ERROR: {e}"
         })
-# SAVE PROCESSING REPORT
-# ============================================================
-
-REPORT_PATH = os.path.join(
-    OUTPUT_DIR,
-    "processing_report.csv"
-)
-
-if len(report) > 0:
-
-    all_keys = set()
-
-    for row in report:
-        all_keys.update(row.keys())
-
-    all_keys = list(all_keys)
-
-    with open(
-        REPORT_PATH,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as csvfile:
-
-        writer = csv.DictWriter(
-            csvfile,
-            fieldnames=all_keys
-        )
-
-        writer.writeheader()
-
-        for row in report:
-            writer.writerow(row)
 
 
 # ============================================================
-# CREATE ZIP FILE
+# 6. SAVE PROCESSING REPORT AS CSV
 # ============================================================
 
-shutil.make_archive(
-    ZIP_PATH,
+REPORT_PATH = OUTPUT_DIR / "processing_report.csv"
+
+fieldnames = [
+    "filename",
+    "output_filename",
+
+    "original_spacing_x",
+    "original_spacing_y",
+    "original_spacing_z",
+
+    "original_size_x",
+    "original_size_y",
+    "original_size_z",
+
+    "original_min_HU",
+    "original_max_HU",
+
+    "resampled_size_z",
+
+    "removed_start_slices",
+    "removed_end_slices",
+
+    "final_size_x",
+    "final_size_y",
+    "final_size_z",
+
+    "final_spacing",
+    "status"
+]
+
+with REPORT_PATH.open(
+    "w",
+    newline="",
+    encoding="utf-8-sig"
+) as csvfile:
+
+    writer = csv.DictWriter(
+        csvfile,
+        fieldnames=fieldnames
+    )
+
+    writer.writeheader()
+    writer.writerows(report)
+
+
+# ============================================================
+# 7. CREATE ZIP ARCHIVE
+# ============================================================
+
+ZIP_FILE = shutil.make_archive(
+    str(ZIP_BASE_PATH),
     "zip",
-    OUTPUT_DIR
+    str(OUTPUT_DIR)
 )
+
+
+# ============================================================
+# 8. FINAL SUMMARY
+# ============================================================
+
+success_count = sum(
+    row.get("status") == "success"
+    for row in report
+)
+
+error_count = len(report) - success_count
 
 print("\n" + "=" * 70)
-
 print("PROCESSING COMPLETED")
 
-print(f"\nProcessed images folder:")
+print(
+    f"Successfully processed: "
+    f"{success_count}/{len(files)}"
+)
+
+print(f"Errors: {error_count}")
+
+print("\nProcessed images folder:")
 print(OUTPUT_DIR)
 
-print(f"\nProcessing report:")
+print("\nProcessing report:")
 print(REPORT_PATH)
 
-print(f"\nZIP file:")
-print(ZIP_PATH + ".zip")
+print("\nZIP file:")
+print(ZIP_FILE)
